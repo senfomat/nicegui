@@ -1,8 +1,8 @@
 import asyncio
-from typing import Optional
 
 from typing_extensions import Self
 
+from ...defaults import DEFAULT_PROP, resolve_defaults
 from ...element import Element
 from ...events import (
     ClickEventArguments,
@@ -18,12 +18,16 @@ from .scene import Scene, SceneCamera
 class SceneView(Element, component='scene_view.js', default_classes='nicegui-scene-view'):
     # NOTE: The ESM is already registered in scene.py.
 
+    @resolve_defaults
     def __init__(self,
                  scene: Scene,
-                 width: int = 400,
-                 height: int = 300,
-                 camera: Optional[SceneCamera] = None,
-                 on_click: Optional[Handler[ClickEventArguments]] = None,
+                 # DEPRECATED: enforce keyword-only arguments in NiceGUI 4.0
+                 width: int = DEFAULT_PROP | 400,
+                 height: int = DEFAULT_PROP | 300,
+                 camera: SceneCamera | None = None,
+                 on_click: Handler[ClickEventArguments] | None = None,
+                 fps: int = DEFAULT_PROP | 20,
+                 show_stats: bool = DEFAULT_PROP | False,
                  ) -> None:
         """Scene View
 
@@ -38,17 +42,27 @@ class SceneView(Element, component='scene_view.js', default_classes='nicegui-sce
         :param height: height of the canvas
         :param camera: camera definition, either instance of ``ui.scene.perspective_camera`` (default) or ``ui.scene.orthographic_camera``
         :param on_click: callback to execute when a 3D object is clicked
+        :param fps: target frame rate for the scene view in frames per second (default: 20, *added in version 3.2.0*)
+        :param show_stats: whether to show performance stats (default: ``False``, *added in version 3.2.0*)
         """
         super().__init__()
         self._props['width'] = width
         self._props['height'] = height
-        self._props['scene_id'] = scene.id
+        self._props['fps'] = fps
+        self._props['show-stats'] = show_stats
+        self._props['scene-id'] = scene.id
         self.camera = camera or Scene.perspective_camera()
-        self._props['camera_type'] = self.camera.type
-        self._props['camera_params'] = self.camera.params
+        self._props['camera-type'] = self.camera.type
+        self._props['camera-params'] = self.camera.params
+        self._initialized_event = asyncio.Event()
         self._click_handlers = [on_click] if on_click else []
         self.on('init', self._handle_init)
         self.on('click3d', self._handle_click)
+
+        self._props.add_rename('camera_params', 'camera-params')  # DEPRECATED: remove in NiceGUI 4.0
+        self._props.add_rename('camera_type', 'camera-type')  # DEPRECATED: remove in NiceGUI 4.0
+        self._props.add_rename('scene_id', 'scene-id')  # DEPRECATED: remove in NiceGUI 4.0
+        self._props.add_rename('show_stats', 'show-stats')  # DEPRECATED: remove in NiceGUI 4.0
 
     def on_click(self, callback: Handler[ClickEventArguments]) -> Self:
         """Add a callback to be invoked when a 3D object is clicked."""
@@ -56,15 +70,14 @@ class SceneView(Element, component='scene_view.js', default_classes='nicegui-sce
         return self
 
     def _handle_init(self) -> None:
+        self._initialized_event.set()
         self.move_camera(duration=0)
         self.run_method('init')
 
     async def initialized(self) -> None:
         """Wait until the scene is initialized."""
-        event = asyncio.Event()
-        self.on('init', event.set, [])
         await self.client.connected()
-        await event.wait()
+        await self._initialized_event.wait()
 
     def _handle_click(self, e: GenericEventArguments) -> None:
         arguments = SceneClickEventArguments(
@@ -88,15 +101,15 @@ class SceneView(Element, component='scene_view.js', default_classes='nicegui-sce
             handle_event(handler, arguments)
 
     def move_camera(self,
-                    x: Optional[float] = None,
-                    y: Optional[float] = None,
-                    z: Optional[float] = None,
-                    look_at_x: Optional[float] = None,
-                    look_at_y: Optional[float] = None,
-                    look_at_z: Optional[float] = None,
-                    up_x: Optional[float] = None,
-                    up_y: Optional[float] = None,
-                    up_z: Optional[float] = None,
+                    x: float | None = None,
+                    y: float | None = None,
+                    z: float | None = None,
+                    look_at_x: float | None = None,
+                    look_at_y: float | None = None,
+                    look_at_z: float | None = None,
+                    up_x: float | None = None,
+                    up_y: float | None = None,
+                    up_z: float | None = None,
                     duration: float = 0.5) -> None:
         """Move the camera to a new position.
 

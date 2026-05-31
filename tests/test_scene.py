@@ -1,11 +1,15 @@
 import weakref
+from typing import Literal
 
 import numpy as np
+import pytest
 from selenium.common.exceptions import JavascriptException
 
-from nicegui import ui
+from nicegui import app, ui
 from nicegui.elements.scene import Object3D
 from nicegui.testing import Screen
+
+from .test_helpers import TEST_DIR
 
 
 def test_moving_sphere_with_timer(screen: Screen):
@@ -107,8 +111,7 @@ def test_replace_scene(screen: Screen):
                 scene.sphere().with_name('sphere')
 
         def replace():
-            container.clear()
-            with container:
+            with container.clear():
                 nonlocal scene
                 with ui.scene() as scene:
                     scene.box().with_name('box')
@@ -196,12 +199,16 @@ def test_gltf(screen: Screen):
     @ui.page('/')
     def page():
         nonlocal scene
+        app.add_static_file(local_file=TEST_DIR / 'media' / 'box.glb', url_path='/box.glb')
         with ui.scene() as scene:
-            scene.gltf('https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/main/Models/Box/glTF-Binary/Box.glb')
+            scene.gltf('/box.glb').material('#ff0000')
 
     screen.open('/')
     screen.wait(1.0)
     assert screen.selenium.execute_script(f'return scene_{scene.html_id}.children.length') == 5
+    assert screen.selenium.execute_script(
+        f'return scene_{scene.html_id}.children[4].getObjectByProperty("isMesh", true).material.color.getHexString()'
+    ) == 'ff0000'
 
 
 def test_no_cyclic_references(screen: Screen):
@@ -220,3 +227,17 @@ def test_no_cyclic_references(screen: Screen):
     screen.open('/')
     screen.click('Clear')
     assert len(objects) == 0
+
+
+@pytest.mark.parametrize('control_type,constructor', [('map', 'MapControls'), ('trackball', 'TrackballControls')])
+def test_custom_controls(screen: Screen, control_type: Literal['map', 'trackball'], constructor: str):
+    scene = None
+
+    @ui.page('/')
+    def page():
+        nonlocal scene
+        scene = ui.scene(control_type=control_type)
+
+    screen.open('/')
+    screen.wait_for(lambda: scene is not None)
+    assert screen.selenium.execute_script(f'return getElement({scene.id}).controls.constructor.name') == constructor

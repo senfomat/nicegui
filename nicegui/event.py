@@ -12,19 +12,17 @@ from weakref import WeakSet
 from typing_extensions import ParamSpec
 
 from . import background_tasks, core, helpers
-from .awaitable_response import AwaitableResponse
-from .client import Client, ClientConnectionTimeout
+from .client import Client
 from .context import context
-from .dataclasses import KWONLY_SLOTS
-from .logging import log
 from .slot import Slot
 
 P = ParamSpec('P')
 
 
-@dataclass(**KWONLY_SLOTS)
+@dataclass(kw_only=True, slots=True)
 class Callback(Generic[P]):
     func: Callable[P, Any] | Callable[[], Any]
+    expect_args: bool
     filepath: str
     line: int
     slot: weakref.ref[Slot] | None = None
@@ -32,10 +30,9 @@ class Callback(Generic[P]):
     def run(self, *args: P.args, **kwargs: P.kwargs) -> Any:
         """Run the callback."""
         with (self.slot and self.slot()) or nullcontext():
-            expect_args = helpers.expects_arguments(self.func)
-            return self.func(*args, **kwargs) if expect_args else self.func()  # type: ignore[call-arg]
+            return self.func(*args, **kwargs) if self.expect_args else self.func()  # type: ignore[call-arg]
 
-    async def await_result(self, result: Awaitable | AwaitableResponse | asyncio.Task) -> Any:
+    async def await_result(self, result: Awaitable) -> Any:
         """Await the result of the callback."""
         with (self.slot and self.slot()) or nullcontext():
             return await result
@@ -59,42 +56,43 @@ class Event(Generic[P]):
         self.instances.add(self)
 
     def subscribe(self, callback: Callable[P, Any] | Callable[[], Any], *,
-                  unsubscribe_on_disconnect: bool | None = None) -> None:
+                  expect_args: bool | None = None,
+                  unsubscribe_on_delete: bool | None = None) -> None:
         """Subscribe to the event.
 
-        The ``unsubscribe_on_disconnect`` can be used to explicitly define
-        whether the callback should be automatically unsubscribed when the client disconnects.
+        The ``unsubscribe_on_delete`` can be used to explicitly define
+        whether the callback should be automatically unsubscribed when the current client is deleted.
         By default, the callback is automatically unsubscribed if subscribed from within a UI context
         to prevent memory leaks.
 
         :param callback: the callback which will be called when the event is fired
-        :param unsubscribe_on_disconnect: whether to unsubscribe the callback when the client disconnects
+        :param expect_args: whether to forward the event's arguments to the callback
+            (default: ``None`` meaning auto-detected from the callback's signature, *added in version 3.13.0*)
+        :param unsubscribe_on_delete: whether to unsubscribe the callback when the current client is deleted
             (default: ``None`` meaning the callback is automatically unsubscribed if subscribed from within a UI context)
         """
         frame = inspect.currentframe()
         assert frame is not None
         frame = frame.f_back
         assert frame is not None
-        callback_ = Callback[P](func=callback, filepath=frame.f_code.co_filename, line=frame.f_lineno)
+        callback_ = Callback[P](
+            func=callback,
+            expect_args=helpers.expects_arguments(callback) or (
+                isinstance(getattr(callback, '__self__', None), Event) and
+                getattr(callback, '__name__', None) in {'emit', 'call'}
+            ) if expect_args is None else expect_args,
+            filepath=frame.f_code.co_filename,
+            line=frame.f_lineno,
+        )
         client: Client | None = None
         if Slot.get_stack():  # NOTE: additional check before accessing `context.slot` which would enter script mode
             callback_.slot = weakref.ref(context.slot)
             client = context.client
-        if callback_.slot is None and unsubscribe_on_disconnect is True:
-            raise RuntimeError('Calling `subscribe` with `unsubscribe_on_disconnect=True` outside of a UI context '
+        if callback_.slot is None and unsubscribe_on_delete is True:
+            raise RuntimeError('Calling `subscribe` with `unsubscribe_on_delete=True` outside of a UI context '
                                'is not supported.')
-        if client is not None and unsubscribe_on_disconnect is not False and not core.is_script_mode_preflight():
-            async def register_disconnect() -> None:
-                try:
-                    await client.connected()
-                    client.on_disconnect(lambda: self.unsubscribe(callback))
-                except ClientConnectionTimeout:
-                    log.debug('Could not register a disconnect handler for callback %s', callback)
-                    self.unsubscribe(callback)
-            if core.loop and core.loop.is_running():
-                background_tasks.create(register_disconnect())
-            else:
-                core.app.on_startup(register_disconnect())
+        if client is not None and unsubscribe_on_delete is not False and not core.is_script_mode_preflight():
+            client.on_delete(lambda: self.unsubscribe(callback))
         self.callbacks.append(callback_)
 
     def unsubscribe(self, callback: Callable[P, Any] | Callable[[], Any]) -> None:
@@ -124,7 +122,7 @@ class Event(Generic[P]):
             if not future.done():
                 future.set_result(args[0] if len(args) == 1 else args if args else None)
 
-        self.subscribe(callback)
+        self.subscribe(callback, expect_args=True)
         try:
             return await asyncio.wait_for(future, timeout)
         except TimeoutError as error:
@@ -139,31 +137,17 @@ class Event(Generic[P]):
 def _invoke_and_forget(callback: Callback[P], *args: P.args, **kwargs: P.kwargs) -> Any:
     try:
         result = callback.run(*args, **kwargs)
-        if _should_await(result):
-            if core.loop and core.loop.is_running():
-                background_tasks.create(callback.await_result(result), name=f'{callback.filepath}:{callback.line}')
-            else:
-                core.app.on_startup(callback.await_result(result))
-    except Exception:
-        log.exception('Could not emit callback %s', callback)
-
-
-async def _invoke_and_await(callback: Callback[P], *args: P.args, **kwargs: P.kwargs) -> Any:
-    try:
-        result = callback.run(*args, **kwargs)
-        if _should_await(result):
-            result = await callback.await_result(result)
-        return result
+        if helpers.should_await(result):
+            background_tasks.create_or_defer(callback.await_result(result), name=f'{callback.filepath}:{callback.line}')
     except Exception as e:
         core.app.handle_exception(e)
 
 
-def _should_await(result: Any) -> bool:
-    """Determine if a result should be awaited.
-
-    Note: We want to await an awaitable result even if the handler is not a coroutine (like a lambda statement).
-    """
-    return isinstance(result, Awaitable) and not isinstance(result, AwaitableResponse) and not isinstance(result, asyncio.Task)
+async def _invoke_and_await(callback: Callback[P], *args: P.args, **kwargs: P.kwargs) -> Any:
+    result = callback.run(*args, **kwargs)
+    if helpers.should_await(result):
+        result = await callback.await_result(result)
+    return result
 
 
 def reset() -> None:

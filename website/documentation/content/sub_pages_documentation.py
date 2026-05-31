@@ -1,7 +1,9 @@
 import asyncio
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any
+from collections.abc import Callable
 
-from nicegui import PageArguments, background_tasks, ui
+from nicegui import PageArguments, background_tasks, helpers, ui
+from nicegui.sub_pages_router import SubPagesRouter
 
 from . import doc
 
@@ -12,32 +14,42 @@ class FakeSubPages(ui.column):
         super().__init__()
         self.routes = routes
         self.data = data
-        self.task: Optional[asyncio.Task] = None
+        self.task: asyncio.Task | None = None
+        self.path_changed_handlers: list[Callable[[str], None]] = []
+        self.route: str | None = None
+
+    def on_path_changed(self, handler: Callable[[str], None]) -> None:
+        self.path_changed_handlers.append(handler)
 
     def init(self) -> None:
         self._render('/')
         self.move()  # move to end
 
-    def link(self, text: str, route: str, **kwargs: Any) -> None:
-        ui.label(text).classes('nicegui-link cursor-pointer').on('click', lambda: self._render(route, **kwargs))
+    def link(self, text: str, route: str, **kwargs: Any) -> ui.label:
+        return ui.label(text).classes('nicegui-link cursor-pointer').on('click', lambda: self._render(route, **kwargs))
 
     def _render(self, route: str, **kwargs: Any) -> None:
         if self.task and not self.task.done():
             self.task.cancel()
 
+        if self.route is not None and self.route != route:
+            for handler in self.path_changed_handlers:
+                handler(route)
+        self.route = route
+
         async def render() -> None:
-            self.clear()
-            with self:
+            with self.clear():
                 result = self.routes[route](**self.data, **kwargs)
-                if isinstance(result, Awaitable):
+                if helpers.should_await(result):
                     await result
         self.task = background_tasks.create(render())
 
 
 class FakeArguments:
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, remaining_path: str = '', **kwargs: Any) -> None:
         self.query_parameters = kwargs
+        self.remaining_path = remaining_path
 
 
 @doc.demo('Sub Pages', '''
@@ -46,8 +58,6 @@ class FakeArguments:
     The `ui.sub_pages` element itself functions as the container for the currently active sub page.
     You only need to provide the routes for each view builder function.
     NiceGUI takes care of replacing the content without triggering a full page reload when the URL changes.
-
-    **NOTE: This is an experimental feature, and the API is subject to change.**
 ''')
 def main_demo() -> None:
     from uuid import uuid4
@@ -107,6 +117,33 @@ def parameters_demo():
         title = ui.label()
     ui.separator()
     sub_pages = FakeSubPages({'/': main, '/other': other}, data={'title': title})
+    sub_pages.init()
+
+
+@doc.demo('Path changed event', '''
+    You can use the current client's `sub_pages_router` to register a callback function to be called when the path changes.
+''')
+def path_changed_event_demo() -> None:
+    # def root():
+    #     ui.sub_pages({'/': main, '/other': other})
+    #     ui.context.client.sub_pages_router.on_path_changed(
+    #         lambda path: ui.notify(f'Navigated to {path}')
+    #     )
+
+    def main():
+        ui.label('Main page content')
+        # ui.link('Go to other page', '/other')
+        sub_pages.link('Go to other page', '/other')  # HIDE
+
+    def other():
+        ui.label('Another page content')
+        # ui.link('Go to main page', '/')
+        sub_pages.link('Go to main page', '/')  # HIDE
+
+    # ui.run(root)
+    # END OF DEMO
+    sub_pages = FakeSubPages({'/': main, '/other': other})
+    sub_pages.on_path_changed(lambda path: ui.notify(f'Navigated to {path}'))
     sub_pages.init()
 
 
@@ -229,6 +266,45 @@ def page_arguments_demo():
     sub_pages.init()
 
 
+@doc.demo('Wildcard Routing', '''
+    For wildcard routing, where a single handler should match multiple paths,
+    use `show_404=False` and access `PageArguments.remaining_path`.
+    This is useful for routing patterns like "/item/*" where everything under "/item/" goes to one handler.
+''')
+def wildcard_demo():
+    from nicegui import PageArguments
+
+    # def root():
+    #     ui.sub_pages({
+    #         '/': main,
+    #         '/item': item,
+    #     }, show_404=False)
+
+    def main():
+        # ui.link('Item 1', '/item/1')
+        # ui.link('Item 2a', '/item/2/a')
+        # ui.link('Item 2b', '/item/2/b')
+        sub_pages.link('Item 1', '/item/1')  # HIDE
+        sub_pages.link('Item 2a', '/item/2/a')  # HIDE
+        sub_pages.link('Item 2b', '/item/2/b')  # HIDE
+
+    def item(args: PageArguments):
+        segments = [s for s in args.remaining_path.split('/') if s]
+        ui.label(f'Item path: {" > ".join(segments)}')
+        # ui.link('back', '/')
+        sub_pages.link('back', '/')  # HIDE
+
+    # ui.run(root)
+    # END OF DEMO
+    sub_pages = FakeSubPages({
+        '/': main,
+        '/item/1': lambda: item(FakeArguments(remaining_path='/1')),  # type: ignore
+        '/item/2/a': lambda: item(FakeArguments(remaining_path='/2/a')),  # type: ignore
+        '/item/2/b': lambda: item(FakeArguments(remaining_path='/2/b')),  # type: ignore
+    })
+    sub_pages.init()
+
+
 @doc.demo('Nested Sub Pages', '''
     Sub pages elements can be nested to create a hierarchical page structure.
     Each of these elements determines which part of the path they should handle by:
@@ -252,6 +328,7 @@ def nested_sub_pages_demo():
 
     def other():
         ui.label('sub page')
+        # ui.link('Go to sub main', '/other')
         # ui.link('Go to A', '/other/a')
         # ui.link('Go to B', '/other/b')
         # ui.sub_pages({
@@ -261,7 +338,7 @@ def nested_sub_pages_demo():
         # }).classes('border border-gray-200 p-2')
         routes = {'/': sub_main, '/a': sub_page_a, '/b': sub_page_b}  # HIDE
         sub_pages = FakeSubPages(routes).classes('border border-gray-200 p-2')  # HIDE
-        sub_pages.link('Go to main', '/')  # HIDE
+        sub_pages.link('Go to sub main', '/')  # HIDE
         sub_pages.link('Go to A', '/a')  # HIDE
         sub_pages.link('Go to B', '/b')  # HIDE
         sub_pages.init()  # HIDE
@@ -283,6 +360,49 @@ def nested_sub_pages_demo():
     sub_pages.init()
 
 
+@doc.demo('Error handling', '''
+    While `ui.sub_pages` will block display of the sub page on page-blocking errors in sync sub page builders,
+    the underlying client is still functional and the in-page exception handler is called for both async and sync builders.
+
+    Note: You may want to refer to the [error handling](section_action_events#error_handling) section for more context.
+''')
+def error_handling_demo():
+    # def root():
+    #     ui.link('Go to main', '/')
+    #     ui.link('Go to /sync_error', '/sync_error')
+    #     ui.link('Go to /async_error', '/async_error')
+    #     ui.sub_pages({
+    #         '/': main,
+    #         '/sync_error': sync_error_page,
+    #         '/async_error': async_error_page,
+    #     })
+    #     ui.on_exception(lambda e: ui.notify(f'Caught exception: {e}'))
+
+    def main():
+        ui.label('Main page')
+
+    def sync_error_page():
+        # ui.label('Synchronous error page')
+        # raise RuntimeError('Synchronous error')
+        ui.label('500: sub page /sync_error produced an error')  # HIDE
+        ui.notify('Caught exception: Synchronous error')  # HIDE
+
+    async def async_error_page():
+        ui.label('Asynchronous error page')
+        # raise RuntimeError('Asynchronous error')
+        ui.notify('Caught exception: Asynchronous error')  # HIDE
+
+    # ui.run(root)
+    # END OF DEMO
+    sub_pages = FakeSubPages({'/': main, '/sync_error': sync_error_page, '/async_error': async_error_page})
+    sub_pages.link('Go to main', '/')
+    sub_pages.link('Go to /sync_error', '/sync_error')
+    sub_pages.link('Go to /async_error', '/async_error')
+    sub_pages.init()
+
+
 doc.reference(ui.sub_pages, title='Reference for ui.sub_pages')
 
 doc.reference(PageArguments, title='Reference for PageArguments')
+
+doc.reference(SubPagesRouter, title='Reference for SubPagesRouter')

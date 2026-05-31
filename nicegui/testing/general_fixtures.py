@@ -1,15 +1,17 @@
-import importlib
-from collections.abc import Generator
-from copy import copy
+import atexit
+import shutil
+import tempfile
 from pathlib import Path
-from typing import Optional
 
 import pytest
-from starlette.routing import Route
 
-from nicegui import Client, app, binding, core, event, run, ui
+from .. import app
+from ..storage import Storage
+from . import general
 
 # pylint: disable=redefined-outer-name
+
+_configured = False
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -17,78 +19,33 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addini('main_file', 'main file', default='main.py')
 
 
-def get_path_to_main_file(config: pytest.Config) -> Optional[Path]:
-    """Get the path to the main file."""
-    main_file = config.getini('main_file')
-    if main_file == '':
+def pytest_configure(config: pytest.Config) -> None:
+    """Set up a session-unique storage path and register the "nicegui_main_file" marker."""
+    global _configured  # pylint: disable=global-statement # noqa: PLW0603
+    if _configured:
+        return
+    _configured = True
+    Storage.path = Path(tempfile.mkdtemp(prefix='nicegui-test-storage-')).resolve()
+    atexit.register(shutil.rmtree, Storage.path, ignore_errors=True)
+    app.storage = Storage()  # rebuild app.storage so its FilePersistentDict picks up the new path
+    config.addinivalue_line('markers', 'nicegui_main_file: specify the main file for the test')
+
+
+def get_path_to_main_file(request: pytest.FixtureRequest) -> Path | None:
+    """Get the path to the main file from the test marker or global config."""
+    marker = next((m for m in request.node.iter_markers('nicegui_main_file')), None)
+    main_file = marker.args[0] if marker else request.config.getini('main_file')
+    if not main_file:
         return None
-    assert config.inipath is not None
-    path = (config.inipath.parent / main_file).resolve()
+    assert request.config.inipath is not None
+    path = (request.config.inipath.parent / main_file).resolve()
     if not path.is_file():
         raise FileNotFoundError(f'Main file not found: {path}')
     return path
 
 
 @pytest.fixture
-def nicegui_reset_globals() -> Generator[None, None, None]:
+def nicegui_reset_globals():
     """Reset the global state of the NiceGUI package."""
-    for route in list(app.routes):
-        if isinstance(route, Route) and (not route.path.startswith('/_nicegui/') or route.path.startswith('/_nicegui/auto/static')):
-            app.remove_route(route.path)
-
-    app.openapi_schema = None
-    app.middleware_stack = None
-    app.user_middleware.clear()
-    app.urls.clear()
-    core.air = None
-    importlib.reload(core)
-    importlib.reload(run)
-
-    # capture initial defaults
-    element_types: list[type[ui.element]] = [ui.element, *find_all_subclasses(ui.element)]
-    default_classes = {t: copy(t._default_classes) for t in element_types}  # pylint: disable=protected-access
-    default_styles = {t: copy(t._default_style) for t in element_types}  # pylint: disable=protected-access
-    default_props = {t: copy(t._default_props) for t in element_types}  # pylint: disable=protected-access
-
-    Client.instances.clear()
-    Client.page_routes.clear()
-    app.reset()
-    binding.reset()
-
-    yield
-
-    app.reset()
-    event.reset()
-
-    # restore initial defaults
-    for t in element_types:
-        t._default_classes = default_classes[t]  # pylint: disable=protected-access
-        t._default_style = default_styles[t]  # pylint: disable=protected-access
-        t._default_props = default_props[t]  # pylint: disable=protected-access
-
-
-def find_all_subclasses(cls: type) -> list[type]:
-    """Find all subclasses of a class."""
-    subclasses = []
-    for subclass in cls.__subclasses__():
-        subclasses.append(subclass)
-        subclasses.extend(find_all_subclasses(subclass))
-    return subclasses
-
-
-def prepare_simulation() -> None:
-    """Prepare the simulation by adding the run config and setting the storage secret."""
-    core.app.config.add_run_config(
-        reload=False,
-        title='Test App',
-        viewport='',
-        favicon=None,
-        dark=False,
-        language='en-US',
-        binding_refresh_interval=0.1,
-        reconnect_timeout=3.0,
-        message_history_length=1000,
-        tailwind=True,
-        prod_js=True,
-        show_welcome_message=False,
-    )
+    with general.nicegui_reset_globals():
+        yield

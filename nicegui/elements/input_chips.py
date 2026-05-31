@@ -1,21 +1,23 @@
-from typing import Any, Literal, Optional, Union
+from typing import Literal
 
+from ..defaults import DEFAULT_PROP, DEFAULT_PROPS, resolve_defaults
 from ..events import GenericEventArguments, Handler, ValueChangeEventArguments
 from .mixins.disableable_element import DisableableElement
 from .mixins.label_element import LabelElement
 from .mixins.validation_element import ValidationDict, ValidationElement, ValidationFunction
 
 
-class InputChips(LabelElement, ValidationElement, DisableableElement):
+class InputChips(LabelElement, ValidationElement[list[str]], DisableableElement):
 
+    @resolve_defaults
     def __init__(self,
-                 label: Optional[str] = None,
+                 label: str | None = DEFAULT_PROP | None,
                  *,
-                 value: Optional[list[str]] = None,
-                 on_change: Optional[Handler[ValueChangeEventArguments]] = None,
-                 new_value_mode: Literal['add', 'add-unique', 'toggle'] = 'toggle',
-                 clearable: bool = False,
-                 validation: Optional[Union[ValidationFunction, ValidationDict]] = None,
+                 value: list[str] | None = DEFAULT_PROPS['model-value'] | None,
+                 on_change: Handler[ValueChangeEventArguments[list[str]]] | None = None,
+                 new_value_mode: Literal['add', 'add-unique', 'toggle'] = DEFAULT_PROP | 'toggle',
+                 clearable: bool = DEFAULT_PROP | False,
+                 validation: ValidationFunction | ValidationDict | None = None,
                  ) -> None:
         """Input Chips
 
@@ -43,6 +45,7 @@ class InputChips(LabelElement, ValidationElement, DisableableElement):
         """
         super().__init__(tag='q-select', label=label, value=value or [], on_value_change=on_change, validation=validation)
 
+        self._props['for'] = self.html_id
         self._props['new-value-mode'] = new_value_mode
         self._props['use-input'] = True
         self._props['use-chips'] = True
@@ -52,5 +55,5 @@ class InputChips(LabelElement, ValidationElement, DisableableElement):
         self._props['hide-dropdown-icon'] = True
         self._props['clearable'] = clearable
 
-    def _event_args_to_value(self, e: GenericEventArguments) -> Any:
+    def _event_args_to_value(self, e: GenericEventArguments) -> list[str]:
         return e.args or []

@@ -1,8 +1,9 @@
 import asyncio
 import os
 import time
-from collections.abc import Awaitable, Generator
+from collections.abc import Callable, Generator
 from concurrent.futures.process import BrokenProcessPool
+from pickle import PicklingError
 
 import pytest
 
@@ -31,7 +32,7 @@ def delayed_hello() -> str:
 
 
 @pytest.mark.parametrize('func', [run.cpu_bound, run.io_bound])
-async def test_delayed_hello(user: User, func: Awaitable):
+async def test_delayed_hello(user: User, func: Callable):
     @ui.page('/')
     async def index():
         ui.label(await func(delayed_hello))
@@ -50,7 +51,7 @@ async def test_run_unpickable_exception_in_cpu_bound_callback(user: User):
 
     @ui.page('/')
     async def index():
-        with pytest.raises(AttributeError, match="Can't pickle local object|Can't get local object"):
+        with pytest.raises((AttributeError, PicklingError), match=r"Can't pickle local object|Can't get local object"):
             ui.label(await run.cpu_bound(raise_unpicklable_exception))
 
     await user.open('/')

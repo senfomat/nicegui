@@ -94,8 +94,16 @@ while True:
 print(f'Found {len(sponsors)} sponsors')
 print(f'Total contributors for NiceGUI: {len(contributors)}')
 
-Path('website/sponsors.json').write_text(json.dumps({
-    'top': [s['login'] for s in sponsors if s['tier_amount'] >= 100 and not s['tier_is_one_time']],
+json_path = Path('website/sponsors.json')
+special_sponsors = json.loads(json_path.read_text(encoding='utf-8'))['special']
+top_sponsors = [
+    s['login']
+    for s in sponsors
+    if s['tier_amount'] >= 100 and not s['tier_is_one_time'] and s['login'] not in special_sponsors
+]
+json_path.write_text(json.dumps({
+    'special': special_sponsors,
+    'top': top_sponsors,
     'total': len(sponsors),
     'contributors': len(contributors),
 }, indent=2) + '\n', encoding='utf-8')
@@ -109,7 +117,7 @@ readme_path = Path('README.md')
 readme_content = readme_path.read_text(encoding='utf-8')
 updated_content = re.sub(
     r'<!-- SPONSORS -->.*?<!-- SPONSORS -->',
-    f'<!-- SPONSORS -->\n{sponsor_html}\n<!-- SPONSORS -->',
+    f'<!-- SPONSORS -->\n\n{sponsor_html}\n<!-- SPONSORS -->',
     readme_content,
     flags=re.DOTALL,
 )

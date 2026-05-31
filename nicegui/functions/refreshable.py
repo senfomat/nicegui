@@ -1,22 +1,22 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, ClassVar, Generic, TypeVar, cast
+from typing import Any, ClassVar, Concatenate, Generic, TypeVar, cast
 
-from typing_extensions import Concatenate, ParamSpec, Self
+from typing_extensions import ParamSpec, Self
 
-from .. import background_tasks, core
-from ..dataclasses import KWONLY_SLOTS
+from .. import background_tasks, helpers
+from ..awaitable_response import AwaitableResponse
 from ..element import Element
-from ..helpers import is_coroutine_function
 
 _S = TypeVar('_S')
 _T = TypeVar('_T')
 _P = ParamSpec('_P')
 
 
-@dataclass(**KWONLY_SLOTS)
+@dataclass(kw_only=True, slots=True)
 class RefreshableTarget:
     container: RefreshableContainer
     refreshable: refreshable
@@ -32,23 +32,17 @@ class RefreshableTarget:
         """Run the function and return the result."""
         RefreshableTarget.current_target = self
         self.next_index = 0
-        # pylint: disable=no-else-return
-        if is_coroutine_function(func):
-            async def wait_for_result() -> Any:
-                with self.container:
-                    if self.instance is None:
-                        result = func(*self.args, **self.kwargs)
-                    else:
-                        result = func(self.instance, *self.args, **self.kwargs)
-                    assert isinstance(result, Awaitable)
-                    return await result
-            return wait_for_result()  # type: ignore
-        else:
-            with self.container:
-                if self.instance is None:
-                    return func(*self.args, **self.kwargs)
-                else:
-                    return func(self.instance, *self.args, **self.kwargs)
+
+        with self.container:
+            if self.instance is None:
+                result = func(*self.args, **self.kwargs)
+            else:
+                result = func(self.instance, *self.args, **self.kwargs)
+
+        if helpers.should_await(result):
+            return cast(_T, helpers.await_with_context(result, self.container))
+
+        return result
 
 
 class RefreshableContainer(Element, component='refreshable.js'):
@@ -77,9 +71,9 @@ class refreshable(Generic[_P, _T]):
     def __getattribute__(self, __name: str) -> Any:
         attribute = object.__getattribute__(self, __name)
         if __name == 'refresh':
-            def refresh(*args: Any, _instance=self.instance, **kwargs: Any) -> None:
+            def refresh(*args: Any, _instance=self.instance, **kwargs: Any) -> AwaitableResponse:
                 self.instance = _instance
-                attribute(*args, **kwargs)
+                return attribute(*args, **kwargs)
             return refresh
         return attribute
 
@@ -90,15 +84,33 @@ class refreshable(Generic[_P, _T]):
         self.targets.append(target)
         return target.run(self.func)
 
-    def refresh(self, *args: Any, **kwargs: Any) -> None:
+    def refresh(self, *args: Any, **kwargs: Any) -> AwaitableResponse:
         """Refresh the UI elements created by this function.
 
         This method accepts the same arguments as the function itself or a subset of them.
         It will combine the arguments passed to the function with the arguments passed to this method.
+
+        If the function is awaited, it will wait for all async refresh operations to complete.
+        Otherwise, the refresh operations are executed in the background as fire-and-forget tasks.
         """
         self.prune()
+        instance = self.instance
+
+        def fire_and_forget() -> None:
+            if awaitables := self._execute_refresh(args, kwargs, instance=instance):
+                background_tasks.create_or_defer(asyncio.gather(*awaitables), name=f'refresh {self.func.__name__}')
+
+        async def wait_for_completion() -> None:
+            if awaitables := self._execute_refresh(args, kwargs, instance=instance):
+                await asyncio.gather(*awaitables)
+
+        return AwaitableResponse(fire_and_forget, wait_for_completion)
+
+    def _execute_refresh(self, args: tuple[Any, ...], kwargs: dict[str, Any], *, instance: Any) -> list[Awaitable[Any]]:
+        """Execute the refresh and return a list of awaitables for async functions."""
+        awaitables: list[Awaitable[Any]] = []
         for target in self.targets:
-            if target.instance != self.instance:
+            if target.instance != instance:
                 continue
             target.container.clear()
             target.args = args or target.args
@@ -112,12 +124,10 @@ class refreshable(Generic[_P, _T]):
                     raise TypeError(f'{parameter} needs to be consistently passed to {function} '
                                     'either as positional or as keyword argument') from e
                 raise
-            if is_coroutine_function(self.func):
-                assert isinstance(result, Awaitable)
-                if core.loop and core.loop.is_running():
-                    background_tasks.create(result, name=f'refresh {self.func.__name__}')
-                else:
-                    core.app.on_startup(result)
+            if helpers.should_await(result):
+                awaitables.append(result)
+
+        return awaitables
 
     def prune(self) -> None:
         """Remove all targets that are no longer on a page with a client connection.

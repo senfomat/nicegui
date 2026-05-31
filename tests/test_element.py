@@ -1,5 +1,4 @@
 import weakref
-from typing import Optional
 
 import pytest
 from selenium.webdriver.common.by import By
@@ -58,7 +57,7 @@ def test_classes(screen: Screen):
     ('transform: translate(120.0px, 50%)', {'transform': 'translate(120.0px, 50%)'}),
     ('box-shadow: 0 0 0.5em #1976d2', {'box-shadow': '0 0 0.5em #1976d2'}),
 ])
-def test_style_parsing(value: Optional[str], expected: dict[str, str]):
+def test_style_parsing(value: str | None, expected: dict[str, str]):
     assert Style.parse(value) == expected
 
 
@@ -89,7 +88,7 @@ def test_style_parsing(value: Optional[str], expected: dict[str, str]):
     ('''object={'one': "foo"} baz''', {'object': {'one': 'foo'}, 'baz': True}),
     ('''object={'one': "foo", "two": "bar"}''', {'object': {'one': 'foo', 'two': 'bar'}}),
 ])
-def test_props_parsing(value: Optional[str], expected: dict[str, str]):
+def test_props_parsing(value: str | None, expected: dict[str, str]):
     assert Props.parse(value) == expected
 
 
@@ -242,6 +241,38 @@ def test_xss(screen: Screen):
     screen.should_contain('<b>Bold 2</b>, `code`, copy&paste, multi\nline')
 
 
+def test_run_method_xss(screen: Screen):
+    @ui.page('/')
+    def page():
+        ui.button('XSS 1', on_click=lambda e: e.sender.run_method('console.error("X" + "SS")'))
+        ui.button('XSS 2', on_click=lambda e: e.sender.run_method('x", console.error("X" + "SS"), "y'))
+
+    screen.allowed_js_errors.append('Method "console.error("X" + "SS")" not found.')
+    screen.allowed_js_errors.append('Method "x", console.error("X" + "SS"), "y" not found.')
+    screen.open('/')
+    screen.click('XSS 1')
+    screen.click('XSS 2')
+    screen.wait(1)
+    assert 'XSS' not in screen.render_js_logs()
+    screen.assert_py_logger('ERROR', 'Method "console.error("X" + "SS")" not found.')
+    screen.assert_py_logger('ERROR', 'Method "x", console.error("X" + "SS"), "y" not found.')
+
+
+def test_get_computed_prop_xss(screen: Screen):
+    @ui.page('/')
+    def page():
+        ui.button('XSS 1', on_click=lambda e: e.sender.get_computed_prop('console.error("X" + "SS")'))
+        ui.button('XSS 2', on_click=lambda e: e.sender.get_computed_prop('x", console.error("X" + "SS"), "y'))
+
+    screen.allowed_js_errors.append('Method "console.error("X" + "SS")" not found.')
+    screen.allowed_js_errors.append('Method "x", console.error("X" + "SS"), "y" not found.')
+    screen.open('/')
+    screen.click('XSS 1')
+    screen.click('XSS 2')
+    screen.wait(1)
+    assert 'XSS' not in screen.render_js_logs()
+
+
 def test_default_props(screen: Screen):
     @ui.page('/')
     def page():
@@ -362,7 +393,7 @@ def test_default_style(screen: Screen):
 def test_invalid_tags(screen: Screen):
     @ui.page('/')
     def page():
-        good_tags = ['div', 'div-1', 'DIV', 'däv', 'div_x', '🙂']
+        good_tags = ['div', 'div-1', 'DIV', 'däv', 'div_x']
         bad_tags = ['<div>', 'hi hi', 'hi/ho', 'foo$bar']
         for tag in good_tags:
             ui.element(tag)
@@ -426,3 +457,36 @@ def test_no_cyclic_references_when_deleting_clients(screen: Screen):
     screen.close()
     screen.wait(1.5)
     assert len(labels) == 0
+
+
+def test_even_special_elements_have_an_html_id(screen: Screen):
+
+    @ui.page('/')
+    def page():
+        elements = [
+            ui.input(),
+            ui.textarea(),
+            ui.number(),
+            ui.date_input(),
+            ui.time_input(),
+            ui.color_input(),
+            ui.select([]),
+            ui.input_chips(),
+            ui.toggle([]),
+            ui.radio([]),
+            ui.upload(),
+        ]
+        with ui.tabs() as tabs:
+            elements += [ui.tab('One')]
+        with ui.tab_panels(tabs, value='One'):
+            elements += [ui.tab_panel('One')]
+
+        @ui.button('Check IDs').on_click
+        async def check_ids():
+            for element in elements:
+                assert await ui.run_javascript(f'document.getElementById("{element.html_id}") !== null')
+            ui.notify('All IDs found')
+
+    screen.open('/')
+    screen.click('Check IDs')
+    screen.should_contain('All IDs found')

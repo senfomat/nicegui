@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import inspect
+import types
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Union, get_args, get_origin
+from typing import TYPE_CHECKING, Any, Union, get_args, get_origin
 
 from starlette.datastructures import QueryParams
-
-from .dataclasses import KWONLY_SLOTS
 
 if TYPE_CHECKING:
     from .elements.sub_pages import SubPages
 
 
-@dataclass(**KWONLY_SLOTS)
+@dataclass(kw_only=True, slots=True)
 class RouteMatch:
     """Contains details about a matched route including path parameters and query data."""
     path: str
@@ -45,7 +45,7 @@ class RouteMatch:
         return f'{self.path=}, {self.pattern=}, builder={self.builder.__name__}, {self.parameters=}, {self.query_params=}, {self.fragment=}, {self.remaining_path=}'
 
 
-@dataclass(**KWONLY_SLOTS)
+@dataclass(kw_only=True, slots=True)
 class PageArguments:
     """Provides unified access to route data including path parameters and query parameters.
 
@@ -61,6 +61,8 @@ class PageArguments:
     '''Query parameters from the request URL.'''
     data: dict[str, Any]
     '''Arbitrary data passed to the ``ui.sub_pages`` element.'''
+    remaining_path: str = ''
+    '''Remaining path after the matched route (useful for wildcard routing).'''
 
     @classmethod
     def build_kwargs(cls, match: RouteMatch, frame: SubPages, data: dict[str, Any]) -> dict[str, Any]:
@@ -101,6 +103,7 @@ class PageArguments:
             path_parameters=route_match.parameters or {},
             query_parameters=route_match.query_params,
             data=data,
+            remaining_path=route_match.remaining_path,
         )
 
     @staticmethod
@@ -122,7 +125,7 @@ class PageArguments:
 
     @staticmethod
     def _unwrap_optional(param_type: type) -> type:
-        """Extract the base type from Optional[T] -> T, or return the type as-is."""
-        if get_origin(param_type) is Union and type(None) in get_args(param_type):
-            return next(arg for arg in get_args(param_type) if arg is not type(None))
+        """Extract the base type from T|None -> T, or return the type as-is."""
+        if get_origin(param_type) is Union and types.NoneType in get_args(param_type):
+            return next(arg for arg in get_args(param_type) if arg is not types.NoneType)
         return param_type

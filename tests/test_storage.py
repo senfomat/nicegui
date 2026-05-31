@@ -1,12 +1,14 @@
 import asyncio
 import copy
 import time
-from pathlib import Path
 
 import httpx
+import pytest
 
-from nicegui import Client, app, background_tasks, context, core, nicegui, ui
+from nicegui import Client, app, background_tasks, context, core, ui
+from nicegui.app.app import prune_tab_storage, prune_user_storage
 from nicegui.persistence.file_persistent_dict import FilePersistentDict
+from nicegui.storage import Storage
 from nicegui.testing import Screen, User
 
 
@@ -96,7 +98,7 @@ def test_access_user_storage_from_fastapi(screen: Screen):
         assert response.status_code == 200
         assert response.text == '"OK"'
         time.sleep(0.5)  # wait for storage to be written
-        assert next(Path('.nicegui').glob('storage-user-*.json')).read_text(encoding='utf-8') == '{"msg":"yes"}'
+        assert next(Storage.path.glob('storage-user-*.json')).read_text(encoding='utf-8') == '{"msg":"yes"}'
 
 
 def test_access_user_storage_on_interaction(screen: Screen):
@@ -110,7 +112,7 @@ def test_access_user_storage_on_interaction(screen: Screen):
     screen.open('/')
     screen.click('switch')
     screen.wait(0.5)
-    assert next(Path('.nicegui').glob('storage-user-*.json')).read_text(encoding='utf-8') == '{"test_switch":true}'
+    assert next(Storage.path.glob('storage-user-*.json')).read_text(encoding='utf-8') == '{"test_switch":true}'
 
 
 def test_access_user_storage_from_button_click_handler(screen: Screen):
@@ -123,7 +125,7 @@ def test_access_user_storage_from_button_click_handler(screen: Screen):
     screen.click('test')
     screen.wait(1)
     assert \
-        next(Path('.nicegui').glob('storage-user-*.json')).read_text(encoding='utf-8') == '{"inner_function":"works"}'
+        next(Storage.path.glob('storage-user-*.json')).read_text(encoding='utf-8') == '{"inner_function":"works"}'
 
 
 def test_access_user_storage_from_background_task(screen: Screen):
@@ -140,7 +142,7 @@ def test_access_user_storage_from_background_task(screen: Screen):
     screen.ui_run_kwargs['storage_secret'] = 'just a test'
     screen.open('/')
     screen.should_contain('Done')
-    assert next(Path('.nicegui').glob('storage-user-*.json')).read_text(encoding='utf-8') == '{"subtask":"works"}'
+    assert next(Storage.path.glob('storage-user-*.json')).read_text(encoding='utf-8') == '{"subtask":"works"}'
 
 
 def test_user_and_general_storage_is_persisted(screen: Screen):
@@ -176,7 +178,7 @@ def test_rapid_storage(screen: Screen):
     screen.open('/')
     screen.click('test')
     screen.wait(0.5)
-    assert Path('.nicegui', 'storage-general.json').read_text(encoding='utf-8') == '{"one":1,"two":2,"three":3}'
+    assert (Storage.path / 'storage-general.json').read_text(encoding='utf-8') == '{"one":1,"two":2,"three":3}'
 
 
 def test_tab_storage_is_local(screen: Screen):
@@ -212,7 +214,7 @@ def test_tab_storage_is_auto_removed(screen: Screen):
     screen.open('/')
     screen.should_contain('2')
 
-    background_tasks.create(nicegui.prune_tab_storage(force=True))
+    background_tasks.create(prune_tab_storage(force=True))
     screen.wait(0.1)
     screen.open('/')
     screen.should_contain('1')
@@ -281,7 +283,7 @@ def test_deepcopy(screen: Screen):
     screen.open('/')
     screen.should_contain('Loaded')
     screen.wait(0.5)
-    assert Path('.nicegui', 'storage-general.json').read_text(encoding='utf-8') == '{"a":{"b":0}}'
+    assert (Storage.path / 'storage-general.json').read_text(encoding='utf-8') == '{"a":{"b":0}}'
 
 
 def test_missing_storage_secret(screen: Screen):
@@ -290,6 +292,7 @@ def test_missing_storage_secret(screen: Screen):
         ui.label(app.storage.user.get('message', 'no message'))
 
     core.app.user_middleware.clear()  # remove the session middlewares added by prepare_simulation by default
+    screen.allowed_js_errors.append('/ - Failed to load resource')
     screen.open('/')
     screen.assert_py_logger('ERROR', 'app.storage.user needs a storage_secret passed in ui.run()')
 
@@ -342,8 +345,8 @@ def test_tab_storage_holds_non_serializable_objects(screen: Screen):
     screen.wait(0.5)
 
 
-def test_user_storage_is_pruned(screen: Screen):
-    @ui.page('/')
+async def test_user_storage_is_pruned(screen: Screen):
+    @ui.page('/', reconnect_timeout=3)
     def page():
         ui.label(f'clients: {len(Client.instances)}')
         ui.label(f'persistent dicts: {len(app.storage._users)}')
@@ -359,15 +362,15 @@ def test_user_storage_is_pruned(screen: Screen):
     assert len(Client.instances) == 1
     assert len(app.storage._users) == 1
 
-    response = httpx.get('http://localhost:3392/status')
+    response = httpx.get(f'http://localhost:{Screen.PORT}/status')
     assert response.status_code == 200
     assert response.text == '"ok"'
     assert len(Client.instances) == 1
     assert len(app.storage._users) == 2
 
     screen.close()
-    Client.prune_instances(client_age_threshold=0)
-    asyncio.run(nicegui.prune_user_storage(force=True))
+    screen.wait(5)  # more than 3 seconds
+    await prune_user_storage(force=True)
     assert len(Client.instances) == 0
     assert len(app.storage._users) == 0
 
@@ -385,3 +388,23 @@ async def test_awaiting_backup_scheduled_during_teardown(user: User, tmp_path):
     await background_tasks.teardown()
     assert path.exists(), 'backup should be written during teardown'
     assert path.read_text(encoding='utf-8') == '{"key":"value"}'
+
+
+@pytest.mark.parametrize('custom_cookie_headers', [False, True])
+def test_storage_cookie_headers(screen: Screen, custom_cookie_headers: bool):
+    @ui.page('/')
+    def page():
+        ui.label('Hello, world!')
+
+    screen.ui_run_kwargs['storage_secret'] = 'just a test'
+    if custom_cookie_headers:
+        screen.ui_run_kwargs['session_middleware_kwargs'] = {'same_site': 'none', 'https_only': True}
+    screen.open('/')
+    with httpx.Client() as http_client:
+        response = http_client.get(f'http://localhost:{Screen.PORT}/')
+        assert response.status_code == 200
+        cookie_settings = str(response.headers.get('set-cookie')).lower()
+        if custom_cookie_headers:
+            assert cookie_settings.endswith('httponly; samesite=none; secure')
+        else:
+            assert cookie_settings.endswith('httponly; samesite=lax')

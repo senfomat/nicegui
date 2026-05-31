@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from fastapi import Request
 from starlette.routing import Match, Route
 
-from . import core
+from . import core, json
 from .context import context
 from .elements.sub_pages import SubPages
 from .functions.on import on
@@ -43,21 +44,34 @@ class SubPagesRouter:
     def on_path_changed(self, handler: Callable[[str], None]) -> None:
         """Register a callback to be invoked when the path changes.
 
-        **This is an experimental feature, and the API is subject to change.**
-
         :param handler: callback function that receives the new path as its argument
         """
         self._path_changed_handlers.append(handler)
 
+    async def refresh(self) -> None:
+        """Refresh the currently shown sub pages.
+
+        This will clear and rebuild the current sub page as if navigating to it again.
+        Useful when you want to update the page content based on changes in data or state.
+
+        *Added in version 3.1.0*
+        """
+        for el in context.client.layout.descendants():
+            if isinstance(el, SubPages):
+                el._reset_match()  # pylint: disable=protected-access
+        await self._handle_open(self.current_path)
+
     async def _handle_open(self, path: str) -> bool:
+        # NOTE: keep a reference to the client because _show clears the slots so that context.client does not work anymore
+        client = context.client
         self.current_path = path
         self.is_initial_request = False
         for callback in self._path_changed_handlers:
             callback(path)
-        for child in context.client.layout.descendants():
+        for child in client.layout.descendants():
             if isinstance(child, SubPages):
                 child._show()  # pylint: disable=protected-access
-        return await self._can_resolve_full_path(context.client)
+        return await self._can_resolve_full_path(client)
 
     async def _handle_navigate(self, path: str) -> None:
         # NOTE: keep a reference to the client because _handle_open clears the slots so that context.client does not work anymore
@@ -67,10 +81,11 @@ class SubPagesRouter:
             not has_any_unresolved_path(client) or  # path is handled by `ui.sub_pages`
             not self._other_page_builder_matches_path(path, client)  # `ui.sub_pages` is still responsible
         ):
+            current_path_string = json.dumps(self.current_path)
             client.run_javascript(f'''
-                const fullPath = (window.path_prefix || '') + "{self.current_path}";
+                const fullPath = (window.path_prefix || '') + {current_path_string};
                 if (window.location.pathname + window.location.search + window.location.hash !== fullPath) {{
-                    history.pushState({{page: "{self.current_path}"}}, "", fullPath);
+                    history.pushState({{page: {current_path_string}}}, "", fullPath);
                 }}
             ''')
         else:
@@ -78,13 +93,15 @@ class SubPagesRouter:
 
     def _other_page_builder_matches_path(self, path: str, client: Client) -> bool:
         """Check if there is any other matching page builder than the one for this client."""
-        client_route = client.request.scope['route']
-        client_func = getattr(client_route.endpoint, '__func__', client_route.endpoint)
+        client_route = client.request.scope.get('route')
+        client_func = \
+            getattr(client_route.endpoint, '__func__', client_route.endpoint) if client_route is not None else None
 
         other_routes = [route for route in core.app.routes if isinstance(route, Route)]
         for other_route in other_routes:
             other_func = getattr(other_route.endpoint, '__func__', other_route.endpoint)
             if (
+                client_func is not None and
                 getattr(client_func, '__name__', None) == getattr(other_func, '__name__', None) and
                 getattr(client_func, '__module__', None) == getattr(other_func, '__module__', None) and
                 getattr(client_func, '__qualname__', None) == getattr(other_func, '__qualname__', None)

@@ -1,19 +1,17 @@
-from __future__ import annotations
-
 import asyncio
 import inspect
 import re
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 from urllib.parse import urlparse
 
 from starlette.datastructures import QueryParams
 from typing_extensions import Self
 
-from .. import background_tasks
+from .. import background_tasks, helpers, json
 from ..context import context
 from ..element import Element
 from ..elements.label import Label
-from ..functions.javascript import run_javascript
 from ..logging import log
 from ..page_arguments import PageArguments, RouteMatch
 
@@ -32,8 +30,6 @@ class SubPages(Element, component='sub_pages.js', default_classes='nicegui-sub-p
         Provides URL-based navigation between different views to build single page applications (SPAs).
         Routes are defined as path patterns mapping to page builder functions.
         Path parameters like "/user/{id}" are extracted and passed to the builder function.
-
-        **This is an experimental feature, and the API is subject to change.**
 
         *Added in version 2.22.0*
 
@@ -67,6 +63,14 @@ class SubPages(Element, component='sub_pages.js', default_classes='nicegui-sub-p
         self._show()
         return self
 
+    def refresh(self) -> None:
+        """Rebuild this sub pages element.
+
+        *Added in version 3.1.0*
+        """
+        self._reset_match()
+        self._show()
+
     def _show(self) -> None:
         """Display the page matching the current URL path."""
         self._rendered_path = ''
@@ -87,8 +91,7 @@ class SubPages(Element, component='sub_pages.js', default_classes='nicegui-sub-p
                 self._set_match(match)
         else:
             self._cancel_active_tasks()
-            self.clear()
-            with self:
+            with self.clear():
                 if match is not None and self._render_page(match):
                     self._set_match(match)
                 else:
@@ -102,19 +105,24 @@ class SubPages(Element, component='sub_pages.js', default_classes='nicegui-sub-p
         except Exception as e:
             self.clear()  # NOTE: clear partial content created before the exception
             self._render_error(e)
+            self.client.handle_exception(e)
             return True
 
         self._handle_scrolling(match, behavior='instant')
-        if asyncio.iscoroutine(result):
+        if helpers.should_await(result):
             async def background_task():
                 with self:
-                    await result
+                    try:
+                        await result
+                    except Exception as e:
+                        self.client.handle_exception(e)
+                        raise
 
             task = background_tasks.create(background_task(), name=f'building sub_page {match.pattern}')
             self._active_tasks.add(task)
 
             def _close_if_canceled(t: asyncio.Task) -> None:
-                if t.cancelled():
+                if t.cancelled() and asyncio.iscoroutine(result):
                     result.close()
                 self._active_tasks.discard(t)
 
@@ -134,8 +142,7 @@ class SubPages(Element, component='sub_pages.js', default_classes='nicegui-sub-p
         self._match = match
         self.has_404 = match is None
         if self.has_404 and self._404_enabled:
-            self.clear()
-            with self:
+            with self.clear():
                 self._render_404()
 
     def _reset_match(self) -> None:
@@ -147,21 +154,22 @@ class SubPages(Element, component='sub_pages.js', default_classes='nicegui-sub-p
         if not relative_path.startswith('/'):
             relative_path = '/' + relative_path
         segments = relative_path.split('/')
+        query_params: QueryParams | None = None
         while segments:
             path = '/'.join(segments)
             if not path:
                 path = '/'
-            match = self._match_route(path)
+            match, query_params = self._match_route(path, query_params)
             if match is not None:
                 match.remaining_path = urlparse(relative_path).path.rstrip('/')[len(match.path):]
                 break
             segments.pop()
         return match
 
-    def _match_route(self, path: str) -> RouteMatch | None:
+    def _match_route(self, path: str, query_params: QueryParams | None) -> tuple[RouteMatch | None, QueryParams | None]:
         parsed_url = urlparse(path)
         path_only = parsed_url.path.rstrip('/')
-        query_params = QueryParams(parsed_url.query) if parsed_url.query else QueryParams()
+        query_params = query_params or QueryParams(parsed_url.query)
         fragment = parsed_url.fragment
         if not path_only.startswith('/'):
             path_only = '/' + path_only
@@ -176,8 +184,8 @@ class SubPages(Element, component='sub_pages.js', default_classes='nicegui-sub-p
                     parameters=parameters,
                     query_params=query_params,
                     fragment=fragment,
-                )
-        return None
+                ), query_params
+        return None, query_params
 
     @staticmethod
     def _match_path(pattern: str, path: str) -> dict[str, str] | None:
@@ -205,14 +213,16 @@ class SubPages(Element, component='sub_pages.js', default_classes='nicegui-sub-p
             self._scroll_to_top(behavior=behavior)
 
     def _scroll_to_fragment(self, fragment: str, *, behavior: str) -> None:
-        run_javascript(f'''
+        self.client.run_javascript(f'''
             requestAnimationFrame(() => {{
-                document.querySelector('#{fragment}, a[name="{fragment}"]')?.scrollIntoView({{ behavior: "{behavior}" }});
+                const frag = {json.dumps(fragment)};
+                const el = document.getElementById(frag) || document.querySelector("a[name=" + JSON.stringify(frag) + "]");
+                el?.scrollIntoView({{ behavior: "{behavior}" }});
             }});
         ''')
 
     def _scroll_to_top(self, *, behavior: str) -> None:
-        run_javascript(f'''
+        self.client.run_javascript(f'''
             requestAnimationFrame(() => {{ window.scrollTo({{top: 0, left: 0, behavior: "{behavior}"}}); }});
         ''')
 

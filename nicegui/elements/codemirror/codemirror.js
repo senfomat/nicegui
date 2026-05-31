@@ -1,5 +1,30 @@
 import * as CM from "nicegui-codemirror";
 
+// Zero-width range so CM6's RangeSet.map() carries each tooltip through edits.
+class TooltipValue extends CM.RangeValue {
+  constructor(content) {
+    super();
+    this.content = content;
+  }
+}
+
+const setTooltipsEffect = CM.StateEffect.define();
+
+const tooltipField = CM.StateField.define({
+  create() {
+    return CM.RangeSet.empty;
+  },
+  update(set, tr) {
+    set = set.map(tr.changes);
+    for (const effect of tr.effects) {
+      if (effect.is(setTooltipsEffect)) {
+        set = CM.RangeSet.of(effect.value, true);
+      }
+    }
+    return set;
+  },
+});
+
 export default {
   template: `
     <div></div>
@@ -12,6 +37,9 @@ export default {
     disable: Boolean,
     indent: String,
     highlightWhitespace: Boolean,
+    lineTooltips: Object,
+    lineTooltipHtml: Boolean,
+    id: String,
   },
   watch: {
     language(newLanguage) {
@@ -23,6 +51,12 @@ export default {
     disable(newDisable) {
       this.setDisabled(newDisable);
     },
+    lineWrapping(newLineWrapping) {
+      this.setLineWrapping(newLineWrapping);
+    },
+    lineTooltips(newTooltips) {
+      this.setLineTooltips(newTooltips);
+    },
   },
   data() {
     return {
@@ -33,6 +67,12 @@ export default {
       }),
     };
   },
+  beforeUnmount() {
+    if (this.editor) {
+      const element = mounted_app.elements[this.$props.id.slice(1)];
+      if (element) element.props.value = this.editor.state.doc.toString();
+    }
+  },
   methods: {
     // Find the language's extension by its name. Case insensitive.
     findLanguage(name) {
@@ -40,8 +80,8 @@ export default {
         for (const alias of [language.name, ...language.alias])
           if (name.toLowerCase() === alias.toLowerCase()) return language;
 
-      console.error(`Language not found: ${this.language}`);
-      console.info("Supported language names:", languages.map((lang) => lang.name).join(", "));
+      console.error(`Language not found: ${name}`);
+      console.info("Supported language names:", this.languages.map((lang) => lang.name).join(", "));
       return null;
     },
     // Get the names of all supported languages
@@ -58,9 +98,8 @@ export default {
         return;
       }
 
-      const lang_description = this.findLanguage(language, this.languages);
+      const lang_description = this.findLanguage(language);
       if (!lang_description) {
-        console.error("Language not found:", language);
         return;
       }
 
@@ -93,16 +132,48 @@ export default {
     },
     setEditorValue(value) {
       if (!this.editor) return;
-      if (this.editor.state.doc.toString() === value) return;
+      const old = this.editor.state.doc.toString();
+      if (old === value) return;
+
+      // Find the changed region so we only replace what differs.
+      // This preserves cursor positions and selections outside the change.
+      let start = 0;
+      while (start < old.length && start < value.length && old[start] === value[start]) start++;
+      let oldEnd = old.length;
+      let newEnd = value.length;
+      while (oldEnd > start && newEnd > start && old[oldEnd - 1] === value[newEnd - 1]) {
+        oldEnd--;
+        newEnd--;
+      }
 
       this.emitting = false;
-      this.editor.dispatch({ changes: { from: 0, to: this.editor.state.doc.length, insert: value } });
+      this.editor.dispatch({ changes: { from: start, to: oldEnd, insert: value.slice(start, newEnd) } });
       this.emitting = true;
     },
     setDisabled(disabled) {
       this.editor.dispatch({
         effects: this.editableConfig.reconfigure(this.editableStates[!disabled]),
       });
+    },
+    setLineWrapping(wrap) {
+      this.editor.dispatch({
+        effects: this.lineWrappingConfig.reconfigure(wrap ? [CM.EditorView.lineWrapping] : []),
+      });
+    },
+    setLineTooltips(tooltips) {
+      if (!this.editor) return;
+      const doc = this.editor.state.doc;
+      const ranges = [];
+      for (const [line, content] of Object.entries(tooltips || {})) {
+        const lineNum = parseInt(line);
+        if (lineNum >= 1 && lineNum <= doc.lines) {
+          const pos = doc.line(lineNum).from;
+          ranges.push(new TooltipValue(content).range(pos, pos));
+        } else {
+          logAndEmit("warning", `line_tooltips: line ${lineNum} out of range [1, ${doc.lines}]`);
+        }
+      }
+      this.editor.dispatch({ effects: setTooltipsEffect.of(ranges) });
     },
     setupExtensions() {
       const self = this;
@@ -119,12 +190,36 @@ export default {
             if (!self.emitting) return;
             self.$emit("update:value", update.changes);
           }
-        }
+        },
       );
+
+      const lineTooltip = CM.hoverTooltip((view, pos) => {
+        const set = view.state.field(tooltipField);
+        const line = view.state.doc.lineAt(pos);
+        let content = null;
+        set.between(line.from, line.to, (_from, _to, value) => {
+          content = value.content;
+          return false;  // at most one tooltip per line — stop after the first match
+        });
+        if (content === null) return null;
+        const renderHtml = self.lineTooltipHtml;
+        return {
+          pos: line.from,
+          above: true,
+          create() {
+            const dom = document.createElement("div");
+            if (renderHtml) dom.setHTML(content);
+            else dom.textContent = content;
+            return { dom };
+          },
+        };
+      });
 
       const extensions = [
         CM.basicSetup,
         changeSender,
+        tooltipField,
+        lineTooltip,
         // Enables the Tab key to indent the current lines https://codemirror.net/examples/tab/
         CM.keymap.of([CM.indentWithTab]),
         // Sets indentation https://codemirror.net/docs/ref/#language.indentUnit
@@ -133,13 +228,13 @@ export default {
         this.themeConfig.of([]),
         this.languageConfig.of([]),
         this.editableConfig.of([]),
+        this.lineWrappingConfig.of([]),
         CM.EditorView.theme({
           "&": { height: "100%" },
           ".cm-scroller": { overflow: "auto" },
         }),
       ];
 
-      if (this.lineWrapping) extensions.push(CM.EditorView.lineWrapping);
       if (this.highlightWhitespace) extensions.push([CM.highlightWhitespace()]);
 
       return extensions;
@@ -156,6 +251,7 @@ export default {
     this.languageConfig = new CM.Compartment();
     this.editableConfig = new CM.Compartment();
     this.editableStates = { true: CM.EditorView.editable.of(true), false: CM.EditorView.editable.of(false) };
+    this.lineWrappingConfig = new CM.Compartment();
 
     const extensions = this.setupExtensions();
 
@@ -170,5 +266,7 @@ export default {
     this.setLanguage(this.language);
     this.setTheme(this.theme);
     this.setDisabled(this.disable);
+    this.setLineWrapping(this.lineWrapping);
+    this.setLineTooltips(this.lineTooltips);
   },
 };

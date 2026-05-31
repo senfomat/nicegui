@@ -1,6 +1,9 @@
 import csv
 import re
-from typing import Callable, Union
+import sys
+import textwrap
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 from fastapi.responses import PlainTextResponse
@@ -29,25 +32,25 @@ async def test_multiple_pages(create_user: Callable[[], User]) -> None:
     def other():
         ui.label('Other page')
 
-    userA = create_user()
-    userB = create_user()
+    user1 = create_user()
+    user2 = create_user()
 
-    await userA.open('/')
-    await userA.should_see('Main page')
-    await userA.should_not_see('Other page')
+    await user1.open('/')
+    await user1.should_see('Main page')
+    await user1.should_not_see('Other page')
 
-    await userB.open('/other')
-    await userB.should_see('Other page')
-    await userB.should_not_see('Main page')
+    await user2.open('/other')
+    await user2.should_see('Other page')
+    await user2.should_not_see('Main page')
 
 
 async def test_source_element(user: User) -> None:
     @ui.page('/')
     def index():
-        ui.image('https://via.placeholder.com/150')
+        ui.image('/image.jpg')
 
     await user.open('/')
-    await user.should_see('placeholder.com')
+    await user.should_see('image.jpg')
 
 
 async def test_button_click(user: User) -> None:
@@ -139,26 +142,26 @@ async def test_multi_user_navigation(create_user: Callable[[], User]) -> None:
         ui.label('Other page')
         ui.button('back', on_click=ui.navigate.back)
 
-    userA = create_user()
-    userB = create_user()
+    user1 = create_user()
+    user2 = create_user()
 
-    await userA.open('/')
-    await userA.should_see('Main page')
+    await user1.open('/')
+    await user1.should_see('Main page')
 
-    await userB.open('/')
-    await userB.should_see('Main page')
+    await user2.open('/')
+    await user2.should_see('Main page')
 
-    userA.find('go to other').click()
-    await userA.should_see('Other page')
-    await userB.should_see('Main page')
+    user1.find('go to other').click()
+    await user1.should_see('Other page')
+    await user2.should_see('Main page')
 
-    userA.find('back').click()
-    await userA.should_see('Main page')
-    await userB.should_see('Main page')
+    user1.find('back').click()
+    await user1.should_see('Main page')
+    await user2.should_see('Main page')
 
-    userA.find('forward').click()
-    await userA.should_see('Other page')
-    await userB.should_see('Main page')
+    user1.find('forward').click()
+    await user1.should_see('Other page')
+    await user2.should_see('Main page')
 
 
 async def test_reload(user: User) -> None:
@@ -189,7 +192,8 @@ async def test_notification(user: User) -> None:
 async def test_checkbox_and_switch(user: User, kind: type) -> None:
     @ui.page('/')
     def page():
-        element = kind('my element', on_change=lambda e: ui.notify(f'Changed: {e.value}'))
+        element = kind('my element', on_change=lambda e: ui.notify(f'Changed: {e.value}')) \
+            .on('click', lambda e: ui.notify(f'Clicked: {e.sender.value}'))
         ui.label().bind_text_from(element, 'value', lambda v: 'enabled' if v else 'disabled')
 
     await user.open('/')
@@ -198,10 +202,12 @@ async def test_checkbox_and_switch(user: User, kind: type) -> None:
     user.find('element').click()
     await user.should_see('enabled')
     await user.should_see('Changed: True')
+    await user.should_see('Clicked: True')
 
     user.find('element').click()
     await user.should_see('disabled')
     await user.should_see('Changed: False')
+    await user.should_see('Clicked: False')
 
 
 @pytest.mark.parametrize('kind', [ui.input, ui.editor, ui.codemirror])
@@ -226,6 +232,28 @@ async def test_input(user: User, kind: type) -> None:
     user.find(kind).type('Test')
     await user.should_see('Value: Test')
     await user.should_see('Changed: Test')
+
+
+async def test_type_number(user: User) -> None:
+    @ui.page('/')
+    def page():
+        number = ui.number()
+        ui.label().bind_text_from(number, 'value', lambda v: f'Value: {v}')
+
+    await user.open('/')
+
+    user.find(ui.number).type('4')
+    await user.should_see('Value: 4.0')
+
+    user.find(ui.number).type('2')
+    await user.should_see('Value: 42.0')
+
+    user.find(ui.number).clear()
+    user.find(ui.number).type('7')
+    await user.should_see('Value: 7.0')
+
+    user.find(ui.number).type('.5')
+    await user.should_see('Value: 7.5')
 
 
 async def test_name_property(user: User) -> None:
@@ -297,10 +325,36 @@ async def test_trigger_event(user: User) -> None:
     await user.should_see('Enter pressed')
 
 
+@pytest.mark.parametrize('args_value,expected', [
+    ({'clientX': 100, 'clientY': 200}, "{'clientX': 100, 'clientY': 200}"),
+    (False, 'False'),
+    (True, 'True'),
+    (0, '0'),
+    (42, '42'),
+    (-17, '-17'),
+    (3.14, '3.14'),
+    ('', "''"),
+    ('hello', "'hello'"),
+    ([], '[]'),
+    ([1, 2, 3], '[1, 2, 3]'),
+    ({}, '{}'),
+    ({'nested': {'key': 'value'}}, "{'nested': {'key': 'value'}}"),
+    (None, '{}'),
+])
+async def test_trigger_with_event_arguments(user: User, args_value: Any, expected: str) -> None:
+    @ui.page('/')
+    def page():
+        ui.button('Click').on('click', lambda e: ui.notify(f'{e.args!r}'))
+
+    await user.open('/')
+    user.find('Click').trigger('click', args=args_value)
+    await user.should_see(expected)
+
+
 async def test_click_link(user: User) -> None:
     @ui.page('/')
     def page():
-        ui.link('go to other', '/other')
+        ui.link('go to other', '/other').on('click', lambda: ui.notify('Link clicked'))
 
     @ui.page('/other')
     def other():
@@ -308,6 +362,7 @@ async def test_click_link(user: User) -> None:
 
     await user.open('/')
     user.find('go to other').click()
+    await user.should_see('Link clicked')
     await user.should_see('Other page')
 
 
@@ -346,26 +401,27 @@ async def test_page_to_string_output_used_in_error_messages(user: User) -> None:
                     - C
                     ''')
         with ui.card().tight():
-            ui.image('https://via.placeholder.com/150')
+            ui.image('/image.jpg')
 
     await user.open('/')
     output = str(user.current_layout)
-    assert output == '''
-q-layout
- q-page-container
-  q-page
-   div
-    Label [markers=first, text=Hello]
-    Row
-     Column
-      Button [markers=second, label=World]
-      Icon [markers=third, name=thumbs-up]
-    Avatar [icon=star]
-    Input [value=typed, label=some input, placeholder=type here, type=text]
-    Markdown [content=## Markdown...]
-    Card
-     Image [src=https://via.placehol...]
-'''.strip()
+    pattern = textwrap.dedent(r'''
+        q-layout
+         q-page-container
+          q-page
+           div
+            Label \[markers=first, text=Hello\]
+            Row
+             Column
+              Button \[markers=second, label=World\]
+              Icon \[markers=third, name=thumbs-up\]
+            Avatar \[icon=star\]
+            Input \[value=typed, label=some input, for=c10, placeholder=type here, type=text\]
+            Markdown \[content=\#\# Markdown..., sanitize=True, resource-name=[^\]]+\]
+            Card
+             Image \[src=/image.jpg\]
+    ''').strip()
+    assert re.fullmatch(pattern, output) is not None
 
 
 async def test_combined_filter_parameters(user: User) -> None:
@@ -482,6 +538,64 @@ async def test_select_multiple_values(user: User):
     assert select.value == ['B']
 
 
+async def test_select_keeps_value_when_toggling_popup(user: User):
+    @ui.page('/')
+    def page():
+        s = ui.select(['Apple', 'Banana', 'Cherry'], label='Fruit', value='Apple')
+        ui.label().bind_text_from(s, 'is_showing_popup', lambda v: 'open' if v else 'closed')
+        ui.label().bind_text_from(s, 'value', lambda v: f'value = {v}')
+
+    await user.open('/')
+    one = user.find('Fruit')
+    await user.should_see('closed')
+    await user.should_see('value = Apple')
+
+    one.click()
+    await user.should_see('open')
+    await user.should_see('value = Apple')
+
+    one.click()
+    await user.should_see('closed')
+    await user.should_see('value = Apple')
+
+
+async def test_select_none_value(user: User) -> None:
+    @ui.page('/')
+    def _():
+        select = ui.select({'a': 'A', None: 'B'}, value=None)
+        ui.label().bind_text_from(select, 'value', lambda v: f'Value: {v}')
+
+    await user.open('/')
+    user.find(ui.select).click()
+    user.find('A').click()
+    await user.should_see('Value: a')
+
+    user.find(ui.select).click()
+    user.find('B').click()
+    await user.should_see('Value: None')
+
+
+async def test_select_click_handler(user: User) -> None:
+    clicks = []
+
+    @ui.page('/')
+    def _():
+        ui.select(['A', 'B', 'C']).on('click', lambda: clicks.append('click'))
+
+    await user.open('/')
+    user.find(ui.select).click()
+    assert len(clicks) == 1, 'Opening select should fire click handler'
+
+    user.find('B').click()
+    assert len(clicks) == 1, 'Clicking option should not fire click handler'
+
+    user.find(ui.select).click()
+    assert len(clicks) == 2, 'Opening select should fire click handler again'
+
+    user.find(ui.select).click()
+    assert len(clicks) == 3, 'Closing select should fire click handler'
+
+
 async def test_upload_table(user: User) -> None:
     @ui.page('/')
     def page():
@@ -507,7 +621,7 @@ async def test_upload_table(user: User) -> None:
 
 
 @pytest.mark.parametrize('data', ['/data', b'Hello'])
-async def test_download_file(user: User, data: Union[str, bytes]) -> None:
+async def test_download_file(user: User, data: str | bytes) -> None:
     @app.get('/data')
     def get_data() -> PlainTextResponse:
         return PlainTextResponse('Hello')
@@ -551,25 +665,23 @@ async def test_trigger_autocomplete(user: User) -> None:
 
 
 async def test_seeing_invisible_elements(user: User) -> None:
-    visible_label = hidden_label = None
-
     @ui.page('/')
     def page():
-        nonlocal visible_label, hidden_label
-        visible_label = ui.label('Visible')
-        hidden_label = ui.label('Hidden')
-        hidden_label.visible = False
+        checkbox = ui.checkbox('Check')
+        ui.label('Label A').bind_visibility_from(checkbox, 'value')
+        ui.label('Label B').bind_visibility_from(checkbox, 'value', value=False)
+        with ui.card().bind_visibility_from(checkbox, 'value'):
+            ui.label('Label C')
 
     await user.open('/')
-    with pytest.raises(AssertionError):
-        await user.should_see('Hidden')
-    with pytest.raises(AssertionError):
-        await user.should_not_see('Visible')
+    await user.should_not_see('Label A')
+    await user.should_see('Label B')
+    await user.should_not_see('Label C')
 
-    visible_label.visible = False
-    hidden_label.visible = True
-    await user.should_see('Hidden')
-    await user.should_not_see('Visible')
+    user.find('Check').click()
+    await user.should_see('Label A')
+    await user.should_not_see('Label B')
+    await user.should_see('Label C')
 
 
 async def test_finding_invisible_elements(user: User) -> None:
@@ -598,14 +710,14 @@ async def test_page_to_string_output_for_invisible_elements(user: User) -> None:
 
     await user.open('/')
     output = str(user.current_layout)
-    assert output == '''
-q-layout
- q-page-container
-  q-page
-   div
-    Label [text=Visible]
-    Label [text=Hidden, visible=False]
-'''.strip()
+    assert output == textwrap.dedent('''
+        q-layout
+         q-page-container
+          q-page
+           div
+            Label [text=Visible]
+            Label [text=Hidden, visible=False]
+    ''').strip()
 
 
 async def test_typing_to_disabled_element(user: User) -> None:
@@ -723,3 +835,176 @@ async def test_tree_with_labels(user: User) -> None:
     await user.should_not_see('A1')
     await user.should_not_see('A21')
     await user.should_not_see('A22')
+
+
+@pytest.mark.order(1)
+async def test_module_import_isolation_first_test(user: User, tmp_path) -> None:  # pylint: disable=unused-argument
+    """First test that imports a module with @ui.page() - should not be there in the next test.
+
+    See https://github.com/zauberzeug/nicegui/pull/5300.
+    """
+    (tmp_path / 'test_isolation_module.py').write_text(textwrap.dedent('''\
+        from nicegui import ui
+
+        value = "from_first_test"
+
+        @ui.page('/test_isolation')
+        def test_page():
+            ui.label('Test isolation page from first test')
+    '''))
+
+    sys.path.insert(0, str(tmp_path))
+    import test_isolation_module  # type: ignore  # noqa: F401
+    assert 'test_isolation_module' in sys.modules
+    assert sys.modules['test_isolation_module'].value == 'from_first_test'  # type: ignore
+
+
+@pytest.mark.order(2)
+async def test_module_import_isolation_second_test(user: User, tmp_path) -> None:  # pylint: disable=unused-argument
+    """Second test that should have a clean sys.modules without imports from previous test.
+
+    See https://github.com/zauberzeug/nicegui/pull/5300.
+    """
+    assert 'test_isolation_module' not in sys.modules, \
+        'test_isolation_module from previous test should not be in sys.modules'
+
+
+async def test_storage_tab_persists_across_navigation(user: User) -> None:
+    @ui.page('/')
+    def root() -> None:
+        ui.button('Write value', on_click=lambda: app.storage.tab.update(value='ABC'))
+
+    @ui.page('/other')
+    def other() -> None:
+        ui.button('Read value', on_click=lambda: ui.notify(app.storage.tab['value']))
+
+    await user.open('/')
+    user.find('Write value').click()
+
+    await user.open('/other')
+    user.find('Read value').click()
+    await user.should_see('ABC')
+
+
+async def test_switching_tabs(user: User) -> None:
+    @ui.page('/')
+    def _():
+        with ui.tabs(on_change=lambda e: ui.notify(f'Switching to {e.value}')):
+            ui.tab('A')
+            ui.tab('B')
+
+    await user.open('/')
+    user.find('A').click()
+    await user.should_see('Switching to A')
+
+
+async def test_switching_tabs_wrapped_in_row(user: User) -> None:
+    @ui.page('/')
+    def _():
+        with ui.tabs(on_change=lambda e: ui.notify(f'Switching to {e.value}')):
+            with ui.row():
+                ui.tab('A')
+                ui.tab('B')
+
+    await user.open('/')
+    user.find('A').click()
+    await user.should_see('Switching to A')
+
+
+async def test_tab_click_handler(user: User) -> None:
+    @ui.page('/')
+    def _():
+        with ui.tabs():
+            ui.tab('A').on('click', lambda: ui.notify('A clicked'))
+            ui.tab('B')
+
+    await user.open('/')
+    user.find('A').click()
+    await user.should_see('A clicked')
+
+
+async def test_clearing_container_with_button_inside(user: User) -> None:
+    @ui.page('/')
+    def page():
+        container = ui.row()
+
+        def rebuild():
+            with container.clear():
+                ui.button('click me') \
+                    .on('click', lambda: ui.notify('First handler')) \
+                    .on('click', rebuild) \
+                    .on('click', lambda: ui.notify('Last handler'))
+
+        rebuild()
+
+    await user.open('/')
+    user.find('click me').click()
+    await user.should_see('First handler')
+    await user.should_see('click me')
+    await user.should_not_see('Last handler')
+
+
+async def test_switching_between_sub_pages(user: User) -> None:
+    calls = {'index': 0, 'a': 0, 'b': 0, 'other': 0}
+
+    @ui.page('/')
+    @ui.page('/b')
+    def index():
+        calls['index'] += 1
+        ui.label(f'Index render {calls["index"]}')
+        ui.button('back', on_click=ui.navigate.back)
+        ui.button('forward', on_click=ui.navigate.forward)
+        ui.button('reload', on_click=ui.navigate.reload)
+        ui.link('Go to "/"', '/')
+        ui.link('Go to "/b"', '/b')
+        ui.link('Go to "/b/"', '/b/')
+        ui.link('Go to "/other"', '/other')
+        ui.sub_pages({
+            '/': lambda: (ui.label('Page A'), calls.update(a=calls['a'] + 1)),
+            '/b': lambda: (ui.label('Page B'), calls.update(b=calls['b'] + 1)),
+        })
+
+    @ui.page('/other')
+    def other_page():
+        calls['other'] += 1
+        ui.label('Other page')
+
+    await user.open('/')
+    await user.should_see('Page A')
+    assert calls == {'index': 1, 'a': 1, 'b': 0, 'other': 0}
+
+    user.find('Go to "/b"').click()
+    await user.should_see('Page B')
+    assert calls == {'index': 1, 'a': 1, 'b': 1, 'other': 0}
+
+    user.find('back').click()
+    await user.should_see('Page A')
+    assert calls == {'index': 1, 'a': 2, 'b': 1, 'other': 0}
+
+    user.find('forward').click()
+    await user.should_see('Page B')
+    assert calls == {'index': 1, 'a': 2, 'b': 2, 'other': 0}
+
+    user.find('Go to "/"').click()
+    await user.should_see('Page A')
+    assert calls == {'index': 1, 'a': 3, 'b': 2, 'other': 0}
+
+    user.find('Go to "/b/"').click()
+    await user.should_see('Page B')
+    assert calls == {'index': 1, 'a': 3, 'b': 3, 'other': 0}
+
+    user.find('Go to "/b/"').click()
+    await user.should_see('Page B')
+    assert calls == {'index': 1, 'a': 3, 'b': 3, 'other': 0}, 'no rebuilding if path stays the same'
+
+    user.find('Go to "/"').click()
+    await user.should_see('Page A')
+    assert calls == {'index': 1, 'a': 4, 'b': 3, 'other': 0}
+
+    user.find('reload').click()
+    await user.should_see('Index render 2')
+    assert calls == {'index': 2, 'a': 5, 'b': 3, 'other': 0}, 'reload triggers a full page reload'
+
+    user.find('Go to "/other"').click()
+    await user.should_see('Other page')
+    assert calls == {'index': 2, 'a': 5, 'b': 3, 'other': 1}, 'navigating to sibling page falls back to full page open'
